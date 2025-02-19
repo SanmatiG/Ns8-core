@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2025 Nethesis S.r.l.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+
+'''
+Get the facts about the cluster itself.
+'''
+
+import json
+import sys
+from cluster import inventory
+import agent
+
+rdb = agent.redis_connect(privileged=True, use_replica=True)
+
+facts = {
+    'subscription': inventory.fact_subscription(rdb),
+    'admins': inventory.fact_admins(rdb),
+    'repositories': inventory.fact_repositories(rdb),
+    'smarthost': inventory.fact_smarthost(rdb),
+    "backup": inventory.fact_backup(rdb),
+}
+json.dump(facts, fp=sys.stdout)

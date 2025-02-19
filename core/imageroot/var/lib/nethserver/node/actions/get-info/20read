@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import json
+import agent
+import sys
+import os
+import subprocess
+
+try:
+    vpn_port = int(subprocess.check_output(['/usr/bin/wg', 'show', 'wg0', 'listen-port'], text=True).rstrip())
+except Exception as ex:
+    print(agent.SD_ERR, ex, file=sys.stderr)
+    vpn_port = 55820
+
+json.dump({
+    "hostname": agent.get_hostname(),
+    "vpn_port": vpn_port,
+}, fp=sys.stdout)

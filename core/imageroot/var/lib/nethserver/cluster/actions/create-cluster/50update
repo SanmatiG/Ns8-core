@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.rdb.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServerdb.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServerdb.  If not, see COPYING.
+#
+
+import sys
+import ipaddress
+import os
+import json
+import agent
+import agent.tasks
+import cluster.grants
+import cluster.vpn
+import uuid
+import pwd
+
+request = json.load(sys.stdin)
+
+network = request['network']
+endpoint = request['endpoint']
+
+agent.assert_exp(network)
+agent.assert_exp(endpoint)
+
+public_key = agent.slurp_file('/etc/nethserver/wg0.pub')
+agent.assert_exp(public_key)
+
+NODE_ID = 1
+ip_address = str(ipaddress.ip_network(network).network_address + NODE_ID)
+
+# Get a Redis connection
+rdb = agent.redis_connect(privileged=True)
+
+# Generate the UUID for the cluster
+rdb.setnx('cluster/uuid', str(uuid.uuid4()))
+# Set default endpoint for PhoneHome
+rdb.setnx('cluster/phonehome/endpoint', 'phonehome.nethserver.org')
+
+#
+# Set the cluster/network and VPN settings in Redis DB
+#
+rdb.set('cluster/network', network)
+rdb.hset(f'node/{NODE_ID}/vpn', mapping={
+    "public_key": public_key,
+    "ip_address": ip_address,
+    "destinations": "",
+    "endpoint": endpoint
+})
+
+# Our first Traefik instance is missing the VPN network: fix it here.
+agent.run_helper('sed', '-i',
+                f'/- 127.0.0.1$/a\ \ \ \ \ \ \ \ - {network}',
+                f'{pwd.getpwnam("traefik1").pw_dir}/.config/state/configs/_api.yml').check_returncode()
+
+# Update the cluster-localnode record in /etc/hosts
+agent.run_helper('sed', '-i',
+    '-e', f'/cluster-localnode$/c\{ip_address} cluster-localnode',
+    '/etc/hosts').check_returncode()
+
+
+# VPN bootstrap
+agent.run_helper('systemctl', 'stop', 'wg-quick@wg0.service')
+cluster.vpn.initialize_wgconf(ip_address)
+agent.run_helper('systemctl', 'start', 'wg-quick@wg0.service').check_returncode()
+
+#
+# Install core modules
+#
+add1_module_failures = agent.tasks.runp_brief([
+        {"agent_id": "cluster", "action": "add-module", "data": {
+            'image': 'ldapproxy',
+            'node': NODE_ID,
+        }},
+        {"agent_id": "cluster", "action": "add-module", "data": {
+            'image': 'loki',
+            'node': NODE_ID,
+        }},
+    ],
+    endpoint = "redis://cluster-leader",
+    progress_callback = agent.get_progress_callback(25, 85),
+)
+agent.assert_exp(add1_module_failures == 0)
+
+# Update completed successfully, enable the phonehome.timer
+agent.run_helper(*'systemctl enable --now phonehome.timer'.split(' ')).check_returncode()
+
+json.dump({
+    "ip_address": ip_address,
+}, fp=sys.stdout)

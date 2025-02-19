@@ -1,0 +1,39 @@
+.DS_Store
+node_modules
+/dist
+
+
+# local env files
+.env.local
+.env.*.local
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor directories and files
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ignore dist directories of ns8 apps
+public/apps/*
+# ...but do NOT ignore libs directory
+!public/apps/libs
+
+# yarn v2 ignored
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Development configuration file
+public/config/config.development.js

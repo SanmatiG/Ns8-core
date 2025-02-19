@@ -1,0 +1,154 @@
+#!/usr/local/bin/runagent python3
+
+#
+# Copyright (C) 2023 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+# Become a leader node if the node_id argument refers to the local node,
+# or point to a new leader node if it differs.
+
+import agent
+import os
+import sys
+import socket
+import json
+import time
+
+self_id = int(os.environ['NODE_ID'])
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--endpoint', required=False, help="Override VPN endpoint setting in Redis DB")
+parser.add_argument('--node', required=True, type=int, help="Node ID of the new leader")
+parser.add_argument('--without-loki', required=False, help="Do not install loki on the new leader node", action='store_false')
+args = parser.parse_args()
+node_id = args.node
+node_endpoint = args.endpoint
+install_loki = args.without_loki
+
+# This command runs under the cluster environment. It always point to the local
+# Redis instance and has admin privileges over it.
+rdb = agent.redis_connect(privileged=True)
+
+leader_id = int(rdb.hget('cluster/environment', 'NODE_ID') or "0")
+
+if not node_endpoint:
+    # Fall back to Redis value
+    node_endpoint = rdb.hget(f'node/{node_id}/vpn', 'endpoint')
+
+try:
+    int(node_endpoint.rsplit(":", 1)[1])
+except Exception as ex:
+    print(f"[ERROR] Missing \":port\" number suffix in VPN endpoint (internal error: {ex})", file=sys.stderr)
+    sys.exit(2)
+
+if not node_endpoint:
+    print(f"[ERROR] Node {node_id} has no VPN endpoint.", file=sys.stderr)
+    sys.exit(2)
+
+node_ipaddr = rdb.hget(f'node/{node_id}/vpn', 'ip_address')
+agent.assert_exp(node_ipaddr) # FATAL error. The designed node has a malformed VPN record
+
+# Every node initally becomes a Redis master, just to fix the leader NODE_ID
+agent.assert_exp(rdb.execute_command("REPLICAOF", "NO", "ONE") == "OK")
+rdb.hset("cluster/environment", "NODE_ID", str(node_id))
+if args.endpoint: # Fix also the node endpoint, if given
+    rdb.hset(f'node/{node_id}/vpn', 'endpoint', node_endpoint)
+
+if node_id == self_id: # Promote this node to leader role
+    node_ipaddr="127.0.0.1" # Override IP address cluster-leader record in /etc/hosts
+
+else: # Become a replica of the new leader node
+    command_reply = rdb.execute_command("REPLICAOF", node_ipaddr, "6379")
+    if command_reply == "OK":
+        attempt = 0
+        while attempt < 100: # Retry up to 10 minutes
+            if rdb.hget("cluster/environment", "NODE_ID") == str(node_id):
+                break # Leader is in charge, VPN settings can be safely applied
+            if attempt == 1:
+                print(f"[WARNING] Waiting for cluster/environment NODE_ID to become {node_id}...", file=sys.stderr)
+            time.sleep(6)
+            attempt += 1
+        else:
+            print("[WARNING] 10 minutes timeout! The designed leader node is not in charge: VPN connection settings with other nodes might be wrong!", file=sys.stderr)
+    elif command_reply[0:2] == "OK":
+        print("[NOTICE] " + command_reply, file=sys.stderr)
+    else:
+        print("[ERROR] Redis REPLICAOF failed: " + command_reply, file=sys.stderr)
+        sys.exit(1)
+
+# Write new Redis configuration to disk.
+agent.assert_exp(rdb.execute_command('CONFIG REWRITE') == 'OK')
+
+# Fix /etc/hosts cluster-leader record
+agent.run_helper('sed', '-i',
+    '-e', f'/cluster-leader$/c\{node_ipaddr} cluster-leader',
+    '/etc/hosts').check_returncode()
+
+# Apply new VPN routes
+agent.run_helper("apply-vpn-routes").check_returncode()
+
+errors = 0 # subtask error counter
+
+# Leader: download and install UI of each module
+if node_id == self_id:
+    with agent.redis_connect() as rdb:
+        for mkey in rdb.scan_iter("module/*/environment"):
+            module_id = mkey.removeprefix("module/").removesuffix("/environment")
+            module_image_url = rdb.hget(mkey, 'IMAGE_URL')
+
+            if agent.run_helper('runagent', 'podman-pull-missing', module_image_url).returncode != 0:
+                print(f"[ERROR] {module_id} image download has failed!", file=sys.stderr)
+                errors += 1
+                continue # skip if download fails
+
+            app_dir = '/var/lib/nethserver/cluster/ui/apps/' + module_id
+            if os.path.exists(app_dir):
+                # The directory could be present but its contents are
+                # stale: remove it.
+                agent.run_helper('rm', '-rf', app_dir)
+
+            # Extract the UI code to a new module home
+            os.mkdir(app_dir)
+            os.chdir(app_dir)
+            if agent.run_helper('extract-ui', module_image_url).returncode != 0:
+                print(f"[ERROR] {module_id} UI extraction has failed!", file=sys.stderr)
+                errors += 1
+
+# Enable/Disable the subscription services
+agent.run_helper("systemctl", "start", "check-subscription")
+
+# Install loki on the leader node, new instance is inside 'module_id' field of the returned JSON
+if install_loki and node_id == self_id:
+    result = agent.tasks.run("cluster", "add-module", data={
+        "image": "loki",
+        "node": node_id,
+        "check_idle_time": 0,
+    },
+    extra={
+        "isNotificationHidden": True,
+    },
+    endpoint="redis://cluster-leader")
+    if result['exit_code'] != 0:
+        print(f"[ERROR] Failed to install loki on the new leader node: {result['error']}", file=sys.stderr)
+        errors += 1
+    else:
+        redis_client = agent.redis_connect(privileged=True)
+        # switch loki default instance for the cluster
+        old_instance = redis_client.get('cluster/default_instance/loki')
+        # update the default instance for the cluster and the node
+        redis_pipeline = redis_client.pipeline()
+        redis_pipeline.set('cluster/default_instance/loki', result['output']['module_id'])
+        redis_pipeline.set(f'node/{node_id}/default_instance/loki', result['output']['module_id'])
+        # publish the event
+        redis_pipeline.publish(f'cluster/event/default-instance-changed', json.dumps({
+            'instance': 'loki',
+            'previous': old_instance,
+            'current': result['output']['module_id'],
+        }))
+        redis_pipeline.execute()
+
+if errors > 0:
+    sys.exit(1)

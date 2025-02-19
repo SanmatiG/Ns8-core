@@ -1,0 +1,49 @@
+#!/usr/local/bin/runagent python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import sys
+import agent.tasks
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('user')
+
+args = parser.parse_args()
+
+# Create the admin user and set a password
+result = agent.tasks.run(
+    agent_id='cluster',
+    action='remove-user',
+    data={
+        "user": args.user,
+    },
+    extra={
+        'title': "cluster/remove-user",
+        'description': "remove-user command",
+        'isNotificationHidden': False,
+    },
+    endpoint="redis://cluster-leader",
+)
+
+print(result['error'], file=sys.stderr, end='')
+print(result['output'])
+sys.exit(result['exit_code'])

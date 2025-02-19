@@ -1,0 +1,61 @@
+#!/usr/local/bin/runagent python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import sys
+import agent.tasks
+import argparse
+import hashlib
+import getpass
+
+parser = argparse.ArgumentParser()
+parser.add_argument('user')
+parser.add_argument('--role', required=True)
+parser.add_argument('--password', default=False, help="If not given, the password is read from stdin")
+
+args = parser.parse_args()
+
+if args.password is False:
+    password = getpass.getpass()
+else:
+    password = args.password
+
+# Create the admin user and set a password
+result = agent.tasks.run(
+    agent_id='cluster',
+    action='add-user',
+    data={
+        "user": args.user,
+        "password_hash": hashlib.sha256(password.encode()).hexdigest(),
+        "set": {},
+        "grant": [{"role":args.role,"on":"*"}],
+    },
+    extra={
+        'title': "cluster/add-user",
+        'description': "add-user command",
+        'isNotificationHidden': False,
+    },
+    endpoint="redis://cluster-leader",
+)
+
+print(result['error'], file=sys.stderr, end='')
+print(result['output'])
+sys.exit(result['exit_code'])

@@ -1,0 +1,92 @@
+#!/usr/local/agent/pyenv/bin/python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import os
+import sys
+import argparse
+import agent
+import pwd
+
+argp = argparse.ArgumentParser(description="Run COMMAND in the agent environment of MODULE_ID")
+argp.add_argument("-m", "--module-id", help="MODULE_ID, a module identifier (e.g. \"module1\", \"node\"). Default is \"cluster\". Only root can use this flag", default="cluster")
+argp.add_argument("-c", "--current-dir", action="store_true", help="Run COMMAND in current directory, instead of changing directory to AGENT_STATE_DIR")
+argp.add_argument('COMMAND', nargs='?', help="Command to run in the agent environment")
+argp.add_argument('ARGS', nargs=argparse.REMAINDER, help="Additional arguments for COMMAND")
+args = argp.parse_args()
+
+def get_username():
+    return pwd.getpwuid(os.geteuid())[0]
+
+def read_env(file_path):
+    env = agent.read_envfile(file_path)
+    os.environ.update(env)
+
+mid = args.module_id
+
+if os.geteuid() != 0:
+    # rootless module
+    if mid not in ['cluster', get_username()]:
+        print(f"runagent: [WARNING] Arguments ignored in rootless mode: --module-id {mid}", file=sys.stderr)
+    home_dir = os.path.expanduser("~")
+    read_env("/etc/nethserver/agent.env")
+    read_env(f"{home_dir}/.config/state/agent.env")
+    read_env(f"{home_dir}/.config/state/environment")
+    os.environ['AGENT_INSTALL_DIR'] = f"{home_dir}/.config"
+    os.environ['AGENT_STATE_DIR'] = f"{home_dir}/.config/state"
+elif os.path.isdir(f"/var/lib/nethserver/{mid}"):
+    # rootfull module
+    read_env("/etc/nethserver/agent.env")
+    read_env(f"/var/lib/nethserver/{mid}/state/agent.env")
+    read_env(f"/var/lib/nethserver/{mid}/state/environment")
+    os.environ['AGENT_INSTALL_DIR'] = f"/var/lib/nethserver/{mid}"
+    os.environ['AGENT_STATE_DIR'] = f"/var/lib/nethserver/{mid}/state"
+else:
+    # if module id is a local Unix user, change process UID and GID
+    # and exec() again
+    try:
+        module_uid = pwd.getpwnam(mid)[2]
+    except:
+        print(f"runagent: [FATAL] Cannot find module {mid} in the local node", file=sys.stderr)
+        sys.exit(1)
+
+    xdg_runtime_dir=f"/run/user/{module_uid}"
+    if os.path.isdir(xdg_runtime_dir):
+        os.execvp("/usr/sbin/runuser", ["runuser", "-s", "/usr/bin/env", "-l", mid, "--", f"XDG_RUNTIME_DIR={xdg_runtime_dir}"] + sys.argv)
+    else:
+        print(f"runagent: [FATAL] Cannot find runtime directory for {mid}", file=sys.stderr)
+        sys.exit(1)
+
+if not args.current_dir:
+    os.chdir(os.environ['AGENT_STATE_DIR'])
+
+os.environ['AGENT_ID'] = os.environ['REDIS_USER']
+
+if args.COMMAND is None:
+    if sys.stdout.isatty() and sys.stdin.isatty():
+        print("runagent: [INFO] starting bash -l", file=sys.stderr)
+        print("runagent: [INFO] working directory:", os.getcwd(), file=sys.stderr)
+        os.execvp('/usr/bin/bash', ['bash', '-l'])
+    else:
+        print(f"runagent: [FATAL] No command given", file=sys.stderr)
+        sys.exit(2)
+
+os.execvp(args.COMMAND, [args.COMMAND] + args.ARGS)

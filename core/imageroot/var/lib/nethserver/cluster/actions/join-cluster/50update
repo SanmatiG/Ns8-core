@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import agent
+import agent.tasks
+import hashlib
+import json
+import sys
+import socket
+
+# Action summary:
+# 1. Send the join request to the remote cluster leader
+# 2. Receive our node_id and VPN IP address
+# 3. Start join-node subtask with VPN parameters, with no-wait flag
+
+request = json.load(sys.stdin)
+
+jwt = request['jwt']
+agent.assert_exp(jwt)
+url = request['url']
+agent.assert_exp(url)
+endpoint = request.get('endpoint', "")
+tls_verify = bool(request['tls_verify'])
+agent.assert_exp(tls_verify is not None)
+
+# Read our VPN public key
+public_key = agent.slurp_file('/etc/nethserver/wg0.pub')
+agent.assert_exp(public_key)
+
+# Import node agent configuration:
+node_env = agent.read_envfile('/var/lib/nethserver/node/state/agent.env')
+node_pw = node_env['REDIS_PASSWORD']
+agent.assert_exp(len(node_pw) > 0)
+node_pwh = hashlib.sha256(node_pw.encode()).hexdigest()
+
+#
+# Invoke the cluster add-node action remotely:
+#
+response = agent.tasks.run(
+    agent_id='cluster',
+    action='add-node',
+    data={
+        "node_pwh": node_pwh,
+        "public_key": public_key,
+        "endpoint": endpoint,
+    },
+    extra={
+        "title": f"add-node {endpoint}" if endpoint else "add-node",
+        "description": "",
+        "isNotificationHidden": False,
+    },
+    parent='', # Our AGENT_TASK_ID is useless in another cluster: force parent to empty string
+    endpoint=url.strip('/') + '/cluster-admin',
+    tls_verify=tls_verify,
+    progress_callback=agent.get_progress_callback(20,98),
+    auth_token=jwt,
+)
+if response['exit_code'] != 0:
+    print(agent.SD_ERR + "add_node error:", response["error"], file=sys.stderr)
+    sys.exit(2)
+
+node_id = response['output']['node_id']
+agent.assert_exp(node_id > 0)
+
+print(f"Leader response is successful: the new node ID is node/{node_id}!", file=sys.stderr)
+
+join_node_data = response['output'] # add-node response is forwarded to join-node
+
+try:
+    # Resolve the leader endpoint address to an IP string:
+    peer_hostname, peer_port = join_node_data['leader_endpoint'].rsplit(':', 1)
+    socket.getaddrinfo(peer_hostname, peer_port, proto=socket.IPPROTO_UDP)[0][4][0]
+except Exception as ex:
+    print(agent.SD_ERR + "leader_endpoint error:", ex, "DATA", join_node_data, file=sys.stderr)
+    print(agent.SD_NOTICE + f"After the issue is solved, remove node {node_id} before running a new join attempt.", file=sys.stderr)
+    raise
+
+# Start the action that switches Redis to replica of the new leader.
+# join-node has to give us enough time to write our response back to the
+# UI caller.
+agent.tasks.run_nowait(
+    agent_id = 'cluster',
+    action = 'join-node',
+    data = join_node_data,
+    endpoint = "redis://cluster-leader"
+)
+
+json.dump({
+    'node_id': node_id,
+}, fp=sys.stdout)

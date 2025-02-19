@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import agent
+import agent.tasks
+import os
+import sys
+import json
+import requests, urllib3.util
+
+terms_url = "https://docs.nethserver.org/projects/ns8/en/latest/subscription.html#terms-and-conditions"
+
+def _get_http_session():
+    osession = requests.Session()
+    osession.timeout = 15 # Timout for HTTP connections
+    oretries = urllib3.util.Retry(
+        total=3,
+        backoff_factor=0.1,
+        allowed_methods={'POST', 'GET'},
+    )
+    osession.mount('https://', requests.adapters.HTTPAdapter(max_retries=oretries))
+    return osession
+
+def fetch_subscription_info_nsent(rdb, attributes):
+    auth_token = attributes['auth_token']
+
+    psession = _get_http_session()
+    myresp = psession.post("https://my.nethesis.it/api/systems/info", data={"secret":auth_token})
+    myresp.raise_for_status()
+    dinfo = myresp.json()
+
+    info = {
+        "auth_token": "********",
+        "system_url": f"https://my.nethesis.it/#/server/{dinfo['id']}",
+        "plan_name": dinfo['subscription']['subscription_plan']['name'],
+        "expires": dinfo['subscription']['valid_until'] > 0,
+        "expire_date": str(dinfo['subscription']['valid_until']),
+        "status": "active",
+        "with_remote_support": True,
+    }
+    return info
+
+def fetch_subscription_info_nscom(rdb, attributes):
+    auth_token = attributes['auth_token']
+
+    psession = _get_http_session()
+    myresp = psession.get(f"{attributes['dartagnan_url']}/machine/info", headers={"Authorization": "token " + auth_token})
+    myresp.raise_for_status()
+    dinfo = myresp.json()
+
+    plan_name = "%s (%s)" % (
+        dinfo['subscription']['subscription_plan']['name'],
+        dinfo['subscription']['subscription_plan']['description'],
+    )
+
+    info = {
+        "auth_token": "********",
+        "system_url": f"https://my.nethserver.com/servers/{dinfo['subscription']['id']}",
+        "plan_name": plan_name,
+        "expires": True,
+        "expire_date": str(dinfo['subscription']['valid_until']),
+        "status": "active",
+        "with_remote_support": False,
+    }
+    return info
+
+def _exit_validation_error(field, value, error, exit_code=2):
+    agent.set_status('validation-failed')
+    json.dump([{
+            'field': field,
+            'parameter': field,
+            'value': value,
+            'error': error
+        }],
+        fp=sys.stdout)
+    sys.exit(exit_code)
+
+try:
+    os_release = agent.read_envfile("/etc/os-release")
+    if os_release["ID"] != '"rocky"' or \
+        os_release["PLATFORM_ID"] != '"platform:el9"':
+        raise Exception("Invalid OS")
+except Exception as ex:
+    json.dump({"subscription": None, "error": "os_not_supported"}, fp=sys.stdout)
+    sys.exit(0)
+
+rdb = agent.redis_connect(privileged=True)
+hsubscription = rdb.hgetall("cluster/subscription") or {}
+if not hsubscription:
+    hsubscription = None
+elif hsubscription["provider"] == "nsent":
+    hsubscription.update(fetch_subscription_info_nsent(rdb, hsubscription))
+elif hsubscription["provider"] == "nscom":
+    hsubscription.update(fetch_subscription_info_nscom(rdb, hsubscription))
+
+json.dump({"subscription": hsubscription, "terms_url": terms_url}, fp=sys.stdout)

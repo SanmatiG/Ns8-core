@@ -1,0 +1,57 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "clone-module input",
+    "$id": "http://schema.nethserver.org/module/clone-module-input.json",
+    "description": "Clone the module state received from rsync",
+    "examples": [
+        {
+            "credentials": [
+                "dokuwiki1",
+                "s3cr3t"
+            ],
+            "port": 20027,
+            "volumes": [
+                "dokuwiki-data"
+            ],
+            "replace": false
+        }
+    ],
+    "type": "object",
+    "required": [
+        "credentials",
+        "replace",
+        "volumes",
+        "port"
+    ],
+    "properties": {
+        "volumes": {
+            "title": "Initial volume set where the module state is stored",
+            "type": "array",
+            "items": {
+                "type": "string",
+                "title": "Name of the volume element"
+            }
+        },
+        "port": {
+            "title": "Rsyncd TCP port number",
+            "type": "integer",
+            "minimum": 1
+        },
+        "credentials": {
+            "title": "Rsyncd service credentials",
+            "description": "An array with two elements: username, password",
+            "type": "array",
+            "maxItems": 2,
+            "minItems": 2,
+            "items": {
+                "type": "string",
+                "minLength": 1
+            }
+        },
+        "replace": {
+            "title": "Replace flag",
+            "description": "If set to true the original module will be erased",
+            "type": "boolean"
+        }
+    }
+}

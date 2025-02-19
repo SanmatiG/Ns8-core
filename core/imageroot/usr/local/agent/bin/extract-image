@@ -1,0 +1,78 @@
+#!/bin/bash
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+image=${1:?missing image URL argument}
+
+set -e
+
+# Prevent concurrent execution of this script with a lock file opened with
+# an arbitrary high FD number, like 201. The lock is created in the
+# working directory, and is released when the script completes:
+exec 201>.extract-image.lock
+flock --verbose -n 201
+
+lst_file=".imageroot.lst"
+
+cid=$(podman create "${image}")
+trap 'podman rm "${cid}"' EXIT
+
+if [[ -f "${lst_file}" ]]; then
+    cp -avf "${lst_file}" "${lst_file}~"
+fi
+
+imageroot=$(podman inspect "${cid}" -f '{{index .Config.Labels "org.nethserver.imageroot"}}' | sed -r 's#(^/|/$)##g')
+if [[ -z "${imageroot}" ]]; then
+    imageroot="imageroot" # Set the default path for the module backend
+fi
+stripcount=$(awk -F/ '{ print NF }' <<<"${imageroot}")
+
+echo "Extracting container filesystem ${imageroot:-/} to ${PWD}"
+podman export "${cid}" | tar \
+    --total \
+    --no-overwrite-dir \
+    --no-same-owner \
+    --exclude-caches-under \
+    --exclude=.gitignore \
+    --strip-components="${stripcount}" \
+    -x -v -f - "${imageroot}" \
+    | sed -r "s#^${imageroot}/#./#" \
+    | LC_ALL=C sort \
+    | tee ${lst_file}
+
+# Clean up old files that are no longer shipped with the image:
+if [[ -f "${lst_file}~" ]]; then
+    dirs_list=()
+
+    while read -r entry; do
+        if [[ -d "${entry}" ]]; then
+            dirs_list+=("${entry}")
+        else
+            rm -vf "${entry}"
+        fi
+    done < <(diff ${lst_file}~ ${lst_file} | sed -n '/^</ {s/^< // ; p}')
+
+    for (( idx=${#dirs_list[@]}-1 ; idx>=0 ; idx-- )) ; do
+        rmdir -v "${dirs_list[idx]}" || :
+    done
+fi
+
+chown -cR --reference=. .

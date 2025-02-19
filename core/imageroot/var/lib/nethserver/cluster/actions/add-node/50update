@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import os
+import sys
+import json
+import agent
+import agent.tasks
+import ipaddress
+import uuid
+import cluster.grants
+
+# Action summary:
+# 1. allocate a VPN IP address for the node
+# 2. create redis acls for the node agent
+
+request = json.load(sys.stdin)
+
+node_pwh = request['node_pwh']
+agent.assert_exp(node_pwh and len(node_pwh) == 64)
+public_key = request['public_key']
+agent.assert_exp(public_key)
+endpoint = request['endpoint']
+agent.assert_exp(type(endpoint) is str)
+flags = request.get('flags', [])
+
+rdb = agent.redis_connect(privileged=True)
+
+#
+# Check if the public key is already used by another cluster node
+#
+for pkey in rdb.scan_iter('node/*/vpn'):
+    xnode_id = pkey.removeprefix('node/').removesuffix('/vpn')
+    if rdb.hget(f"node/{xnode_id}/vpn", "public_key") != public_key:
+        continue
+    print(agent.SD_WARNING + f"The public key {public_key} is already used by node {xnode_id}", file=sys.stderr)
+    agent.set_status('validation-failed')
+    json.dump([{'field':'public_key', 'parameter':'public_key', 'error':'public_key_matches_existing_node', 'value': xnode_id}], fp=sys.stdout)
+    sys.exit(2)
+
+#
+# Retrieve the leader VPN attributes, required by the caller to complete
+# the join-cluster action
+#
+leader_id = rdb.hget('cluster/environment', 'NODE_ID')
+leader_ip_address = rdb.hget(f'node/{leader_id}/vpn', 'ip_address')
+agent.assert_exp(leader_ip_address)
+leader_public_key = rdb.hget(f'node/{leader_id}/vpn', 'public_key')
+agent.assert_exp(leader_public_key)
+leader_endpoint = rdb.hget(f'node/{leader_id}/vpn', 'endpoint')
+agent.assert_exp(leader_endpoint)
+
+#
+# Generate a new node_id and VPN IP address
+#
+network = ipaddress.ip_network(rdb.get('cluster/network'))
+node_id = int(rdb.incr(f'cluster/node_sequence'))
+ip_address = str(network.network_address + node_id)
+
+#
+# Store VPN settings of the new node
+#
+agent.assert_exp(rdb.hset(f'node/{node_id}/vpn', mapping={
+    "public_key": public_key,
+    "ip_address": ip_address,
+    "destinations": "",
+    "endpoint": endpoint,
+}) >= 0)
+
+# Save node flags
+for flag in flags:
+    rdb.sadd(f'node/{node_id}/flags', flag)
+
+#
+# Create redis acls for the node agent
+#
+agent.assert_exp(rdb.execute_command('ACL', 'SETUSER',
+    f'node/{node_id}', 'ON', '#' + node_pwh,
+    'resetkeys', f'~node/{node_id}/*', f'~task/node/{node_id}/*',
+    'resetchannels', f'&progress/node/{node_id}/*', f'&node/{node_id}/event/*',
+    'nocommands', '+@read', '+@write', '+@transaction', '+@connection', '+publish', '-@admin',
+    '+psync', '+replconf', # commands for replication
+) == 'OK')
+
+#
+# Additional tasks for the new node: they are picked up when the
+# join-cluster has been completed in a random order and must not depend on
+# each other.
+#
+additional_tasks = [
+    {
+        # Remove the default traefik1 instance from the worker node. This
+        # task races against "add-module traefik", however it should
+        # always win because the latter has to download the Traefik image
+        # and in the worst case, the new Traefik instance will start a
+        # crash-loop until ports 80 and 443 are freed.
+        'agent_id': f'node/{node_id}',
+        'action': 'remove-module',
+        'data': {
+            "module_id": 'traefik1',
+            "preserve_data": False,
+        }
+    },
+    {
+        'agent_id': 'cluster',
+        'action': 'add-module',
+        'data': {
+            "image": 'traefik',
+            "node": node_id,
+            "check_idle_time": 0,
+        }
+    },
+    {
+        'agent_id': 'cluster',
+        'action': 'add-module',
+        'data': {
+            "image": 'ldapproxy',
+            "node": node_id,
+            "check_idle_time": 0,
+        }
+    },
+]
+
+if not 'nomodules' in flags:
+    subtasks = agent.tasks.runp_nowait(
+        additional_tasks,
+        endpoint="redis://cluster-leader",
+    )
+
+# Define the default roles on the new node (owner, reader)
+cluster.grants.grant(rdb, '*', f'node/{node_id}', 'owner')
+cluster.grants.grant(rdb, "list-*", f'node/{node_id}', "reader")
+cluster.grants.grant(rdb, "get-*", f'node/{node_id}', "reader")
+cluster.grants.grant(rdb, "show-*", f'node/{node_id}', "reader")
+cluster.grants.grant(rdb, "read-*", f'node/{node_id}', "reader")
+cluster.grants.grant(rdb, "add-public-service",  f'node/{node_id}', "fwadm")
+cluster.grants.grant(rdb, "remove-public-service", f'node/{node_id}', "fwadm")
+cluster.grants.grant(rdb, "add-custom-zone",  f'node/{node_id}', "fwadm")
+cluster.grants.grant(rdb, "remove-custom-zone", f'node/{node_id}', "fwadm")
+
+cluster.grants.grant(rdb, "add-public-service",  f'node/{node_id}', "tunadm")
+cluster.grants.grant(rdb, "remove-public-service", f'node/{node_id}', "tunadm")
+cluster.grants.grant(rdb, "add-custom-zone",  f'node/{node_id}', "tunadm")
+cluster.grants.grant(rdb, "remove-custom-zone", f'node/{node_id}', "tunadm")
+cluster.grants.grant(rdb, "add-tun",  f'node/{node_id}', "tunadm")
+cluster.grants.grant(rdb, "remove-tun", f'node/{node_id}', "tunadm")
+
+cluster.grants.grant(rdb, "allocate-ports", f'node/{node_id}', "portsadm")
+cluster.grants.grant(rdb, "deallocate-ports", f'node/{node_id}', "portsadm")
+cluster.grants.grant(rdb, "allocate-ports", f'node/{node_id}', "fwadm,portsadm")
+cluster.grants.grant(rdb, "deallocate-ports", f'node/{node_id}', "fwadm,portsadm")
+cluster.grants.grant(rdb, "add-public-service", f'node/{node_id}', "fwadm,portsadm")
+cluster.grants.grant(rdb, "remove-public-service", f'node/{node_id}', "fwadm,portsadm")
+cluster.grants.grant(rdb, "add-custom-zone", f'node/{node_id}', "fwadm,portsadm")
+cluster.grants.grant(rdb, "remove-custom-zone", f'node/{node_id}', "fwadm,portsadm")
+cluster.grants.grant(rdb, "allocate-ports", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "deallocate-ports", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "add-tun", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "remove-tun", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "add-public-service", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "remove-public-service", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "add-custom-zone", f'node/{node_id}', "tunadm,portsadm")
+cluster.grants.grant(rdb, "remove-custom-zone", f'node/{node_id}', "tunadm,portsadm")
+
+# Grant on cascade the owner role on the new node, to users with the owner
+# role on cluster
+for userk in rdb.scan_iter('roles/*'):
+    user_auths = rdb.hgetall(userk)
+    if 'cluster' in user_auths and user_auths['cluster'] == 'owner':
+        rdb.hset(userk, f'node/{node_id}', 'owner')
+
+# Save ACLs on the disk and propagate to worker nodes
+cluster.grants.save_acls(rdb)
+
+#
+# Reconfigure VPN routes
+#
+rdb.publish('cluster/event/vpn-changed', json.dumps({"node_id":node_id}))
+
+#
+# Return the new information to the caller
+#
+json.dump({
+    "node_id": node_id, # required to set up node agent
+    "ip_address": ip_address, # required to set up wg0 device
+    "leader_public_key": leader_public_key, # required for VPN auth
+    "network": str(network), # required to set up route table
+    "leader_ip_address": leader_ip_address, # required to rewrite /etc/hosts cluster-leader
+    "leader_endpoint": leader_endpoint, # required to reach the VPN public endpoint
+}, sys.stdout)

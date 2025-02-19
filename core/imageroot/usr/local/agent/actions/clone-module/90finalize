@@ -1,0 +1,22 @@
+#!/bin/bash
+
+#
+# Copyright (C) 2023 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+set -e
+exec 1>&2 # Redirect any output to the journal (stderr)
+
+# Clean up clone-module state files
+trap 'rm -vf ./*.clone-module' EXIT
+
+# Rootfull modules must implement this step on their own!
+if [[ $EUID == 0 ]]; then
+    exit 0
+fi
+
+# Restore enabled state of .service and .timer units
+xargs -r -- systemctl --user enable < timers-target.clone-module
+xargs -r -- systemctl --user enable < default-target.clone-module
+systemctl --user isolate default.target

@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import json
+import agent
+import agent.tasks
+import sys, os
+import cluster.modules
+
+if not os.getenv("AGENT_TASK_USER"):
+    # If invoked from apply-updates command, switch to managed repo view:
+    cluster.modules.select_repo_view('managed')
+
+request = json.load(sys.stdin)
+force_update = request.get("force", False)
+agent_install_dir = os.environ["AGENT_INSTALL_DIR"]
+
+agent.run_helper("run-scriptdir", f"{agent_install_dir}/update-core-pre-modules.d/")
+
+rdb = agent.redis_connect(privileged=True)
+
+# Update all core modules
+update_module_tasks = []
+for uinstance in cluster.modules.list_updates(rdb, skip_core_modules=False):
+    if not 'core_module' in uinstance.get('flags', []):
+        continue # skip module without core_module flag
+    update_module_tasks.append({
+        'agent_id': 'cluster',
+        "action": "update-module",
+        "data": {
+            "module_url": uinstance['source'] + ':' + uinstance['update'],
+            "instances":  [uinstance['id']],
+            "force": force_update,
+        }
+    })
+
+update_module_errors = agent.tasks.runp_brief(update_module_tasks,
+    endpoint = "redis://cluster-leader",
+    progress_callback=agent.get_progress_callback(75, 95),
+)
+
+agent.run_helper("run-scriptdir", f"{agent_install_dir}/update-core-post-modules.d/")
+
+agent.assert_exp(update_module_errors == 0, 'update-core failed in some core modules')

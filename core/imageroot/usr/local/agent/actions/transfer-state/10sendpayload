@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2023 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+
+import subprocess
+import sys
+import json
+import agent
+import os
+import re
+
+request = json.load(sys.stdin)
+address = request['address']
+port = int(request['port'])
+replace = bool(request['replace'])
+username, password = request['credentials']
+
+# Prepare a copy of the source module environment that can be transfered
+agent.run_helper('cp', '-v', 'environment', 'environment.clone-module').check_returncode()
+
+if os.geteuid() != 0:
+    # Dump the Systemd enabled services list
+    with open('default-target.clone-module', 'w') as fpout:
+        agent.run_helper(*'systemctl --user show default.target -p Wants --value'.split(), stdout=fpout).check_returncode()
+
+    with open('timers-target.clone-module', 'w') as fpout:
+        proc = subprocess.run('systemctl --user show timers.target -p Wants --value'.split(), text=True, capture_output=True)
+        if proc.returncode != 0:
+            sysm.exit(3)
+        tlist = re.sub(r"\bbackup[0-9]+\.timer\b", '', proc.stdout) # remove backup timers
+        fpout.write(tlist)
+
+errors = 0
+os.environ['RSYNC_PASSWORD'] = password
+podman_cmd = [
+    'podman', 'run', '-i', '--workdir=/srv', '--rm', '--network=host', '--privileged',
+    '--replace', '--name=transfer-state-payload',
+    '--env=RSYNC_PASSWORD',
+]
+
+rsync_cmd = [
+    'rsync',
+    '-a',
+    '--info=progress2',
+
+    # high-priority, harcoded filter rules: they cannot be overriden
+    '--exclude=/state/agent.env',
+    '--exclude=/state/environment',
+    '--exclude=/state/apitoken.cache',
+]
+
+if os.path.isfile(os.environ['AGENT_INSTALL_DIR'] + '/etc/state-filter-rules.rsync'):
+    podman_cmd += [f"--volume={os.environ['AGENT_INSTALL_DIR']}/etc/state-filter-rules.rsync:/srv/state-filter-rules.rsync"]
+    rsync_cmd += ["--filter=. state-filter-rules.rsync"]
+
+rsync_cmd += [
+    './', # source: workdir
+    f'rsync://{username}@{address}:{port}/data/', # destination, remote rsync "data" module
+]
+
+core_env = agent.read_envfile('/etc/nethserver/core.env') # Import URLs of core images
+
+transfer_cmd = [*podman_cmd, *agent.get_existing_volume_args(), core_env['RSYNC_IMAGE'], *rsync_cmd]
+print(agent.SD_DEBUG + " ".join(transfer_cmd), file=sys.stderr)
+with subprocess.Popen(transfer_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True) as pclient:
+    # Parse rsync --info output to set the task progress
+    buf = ''
+    cprogress = 0
+    while True:
+        ch = pclient.stdout.read(1)
+        if not ch:
+            break
+        elif ch == '%':
+            try:
+                progress = int(float(buf[-3:]) * 0.99)
+                if progress > cprogress:
+                    agent.set_progress(progress)
+                    cprogress = progress
+            except:
+                pass
+            buf = ''
+        elif ch == '\r' or ch == '\n':
+            buf = ''
+        else:
+            buf += ch
+
+if pclient.returncode == 24:
+    print(agent.SD_DEBUG + "Ignored rsync exit code 24: files vanished during the transfer will be fixed by the next step.", file=sys.stderr)
+    sys.exit(0)
+else:
+    sys.exit(pclient.returncode)

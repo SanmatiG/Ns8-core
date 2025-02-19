@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2024 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-2.0-only
+#
+
+import json
+import subprocess
+import os
+import sys
+import ipaddress as ipm
+import agent
+import agent.tasks
+from agent.ldapproxy import Ldapproxy
+from agent.ldapclient import Ldapclient
+
+def _run(cmd):
+    try:
+        proc = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        return proc.stdout.rstrip().lstrip()
+    except:
+        return ''
+
+def _run_json(cmd):
+    try:
+        return json.loads(_run(cmd))
+    except:
+        return None
+
+def _get_cpu_field(field, cpu_info):
+    for f in cpu_info:
+        if f['field'].startswith(field):
+            return f['data']
+
+def _get_networks():
+    networks = []
+    ifgateway = {}
+
+    # Find gateway of interfaces
+    with subprocess.Popen(["ip", "-j", "route", "show"], stdout=subprocess.PIPE) as proc:
+        for iroute in json.load(proc.stdout):
+            if 'gateway' in iroute:
+                ifgateway[iroute["dev"]] = iroute["gateway"]
+
+    # Find the first IP address of every interface
+    with subprocess.Popen(["ip", "-j", "address", "show"], stdout=subprocess.PIPE) as proc:
+        for iface in json.load(proc.stdout):
+            try:
+                ainfo = iface['addr_info'][0] # get the first IP address
+            except:
+                continue # skip
+
+            addr = ipm.ip_address(ainfo['local'])
+
+            if(addr.is_unspecified or addr.is_reserved or addr.is_loopback or addr.is_link_local):
+                continue # skip
+
+            anet = ipm.ip_network(ainfo['local'] + '/' + str(ainfo['prefixlen']), strict=False)
+
+            if iface['ifname'] == 'wg0':
+                ifrole = 'gray'
+                iftype = 'ethernet'
+            elif addr.is_private:
+                ifrole = 'green'
+                iftype = 'ethernet'
+            else:
+                ifrole = 'orange'
+                iftype = 'ethernet'
+
+            # green interface
+            networks.append({
+                "type": iftype,
+                "name": iface['ifname'],
+                "props": {
+                    "role": ifrole,
+                    "ipaddr": ainfo['local'],
+                    "netmask": str(anet.netmask),
+                    "gateway": ifgateway.get(iface['ifname'], "")
+                },
+            })
+
+    return networks
+
+def _get_nameservers():
+    output = _run("awk '/^nameserver/ {print $2}' < /etc/resolv.conf")
+    return output.replace("\n", ",")
+
+def _get_mountpoints():
+    mountpoints = {}
+    try:
+        dfrows = _run("df -l -x tmpfs -x shm -x overlay -x devtmpfs --output=source,size,used,avail").split("\n")
+        dfrows.pop(0)
+        for dfline in dfrows:
+            src, size, used, avail = dfline.split()
+            mountpoints[src] = {
+                "size_bytes": int(size) * 1024,
+                "used_bytes": int(used) * 1024,
+                "available_bytes": int(avail) * 1024,
+            }
+    except Exception as ex:
+        print(ex, file=sys.stderr)
+    return mountpoints
+
+def _get_os_release():
+    os_release = {}
+    try:
+        # Read the file into a dict, stripping double quotes from values:
+        os_release = dict([(k, v.strip('"')) for k,v in agent.read_envfile("/etc/os-release").items()])
+    except Exception as ex:
+        print(ex, file=sys.stderr)
+
+    return os_release
+
+def _get_cluster_views():
+    rdb = agent.redis_connect(use_replica=True)
+    hmodule_domains = rdb.hgetall('cluster/module_domains') or {}
+    hmodule_node = rdb.hgetall('cluster/module_node') or {}
+    def get_domain_counters(kdom):
+        try:
+            domparams = Ldapproxy().get_domain(kdom)
+            # Fetch domain and calculate active users
+            cldap = Ldapclient.factory(**domparams)
+            lusers = cldap.list_users()
+            lgroups = cldap.list_groups()
+        except Exception as ex:
+            print(agent.SD_ERR + f"Failed to count accounts of LDAP domain {kdom}", str(ex), file=sys.stderr)
+            lusers = []
+            lgroups = []
+        return {
+            "active_users": sum(bool(user.get("locked", False)) == False for user in lusers),
+            "total_users": len(lusers),
+            "total_groups": len(lgroups),
+        }
+
+    # Fill tables with bound modules counters:
+    oud_map = {}
+    # 0-M relation: a module can be associated to any number of user
+    # domains!
+    omodule_domain_table = []
+    for module_id, dom_list in hmodule_domains.items():
+        module_name = module_id.rstrip('0123456789')
+        for kdom in dom_list.split():
+            if not kdom in oud_map:
+                oud_map[kdom] = {"domain_id": kdom}
+                # Long operation: do it once for each domain:
+                oud_map[kdom].update(get_domain_counters(kdom))
+
+            oud_map[kdom].setdefault(module_name + "_count", 0)
+            oud_map[kdom][module_name + "_count"] += 1
+
+            omodule_domain_table.append({
+                "module_id": module_id,
+                "instance_of": module_name,
+                "domain_id": kdom,
+                "node_id": int(hmodule_node.get(module_id)),
+                "active_users": oud_map[kdom]["active_users"],
+                "total_users": oud_map[kdom]["total_users"],
+                "total_groups": oud_map[kdom]["total_groups"],
+            })
+
+    # Unbound modules (those without an LDAP domain) temporary table:
+    tmp_unbound_modules_table = {}
+
+    # Collect facts from modules:
+    for module_id, node_id in hmodule_node.items():
+
+        list_actions_result = agent.tasks.run(
+            agent_id='module/' + module_id,
+            action='list-actions',
+            extra={
+                'isNotificationHidden': True,
+            },
+            endpoint="redis://cluster-leader",
+        )
+
+        if not list_actions_result or list_actions_result['exit_code'] != 0:
+            print(agent.SD_WARNING + f"module/{module_id}/list-actions failed", file=sys.stderr)
+            continue # skip module if the list-actions task fails
+        elif not 'get-facts' in list_actions_result.get('output', []):
+            continue # skip module if it does not implement get-facts
+
+        get_facts_result = agent.tasks.run(
+            agent_id='module/' + module_id,
+            action='get-facts',
+            extra={
+                'isNotificationHidden': True,
+            },
+            endpoint="redis://cluster-leader",
+        )
+
+        if get_facts_result['exit_code'] != 0:
+            print(agent.SD_WARNING, f"get-facts failed for {module_id}", file=sys.stderr)
+            continue
+
+        ofacts = get_facts_result['output']
+
+        module_is_unbound = True
+        for omodule_record in omodule_domain_table:
+            if module_id == omodule_record["module_id"]:
+                # Merge facts with bound module record
+                omodule_record.update(ofacts)
+                module_is_unbound = False
+        if module_is_unbound:
+            # Create an unbound module record
+            module_name = module_id.rstrip('0123456789')
+            orecord = {
+                "domain_id": None,
+                "active_users": None,
+                "total_users": None,
+                "total_groups": None,
+                "module_id": module_id,
+                "instance_of": module_name,
+                "node_id": int(node_id),
+            }
+            # Merge facts with unbound module record
+            orecord.update(get_facts_result['output'])
+            tmp_unbound_modules_table[module_id] = orecord
+
+    return {
+        "cluster_module_domain_table": omodule_domain_table + list(tmp_unbound_modules_table.values()),
+        "cluster_user_domains_table": list(oud_map.values()),
+    }
+
+def _get_public_ip():
+    """Ensure the output of the remote call is a valid IP string"""
+    public_ip_response = _run('curl https://ifconfig.co')
+    try:
+        ipm.ip_address(public_ip_response)
+    except ValueError:
+        public_ip_response = ""
+
+    return public_ip_response
+
+podman_info = _run_json('podman system info -f json')
+cpu_info = _run_json('lscpu -J')['lscpu']
+board = _run("cat /sys/devices/virtual/dmi/id/board_name") or "board.unknown"
+dmi_product = _run("cat /sys/devices/virtual/dmi/id/product_name") or "product.unknown"
+os_release = _get_os_release()
+
+data = {
+    "public_ip": _get_public_ip(),
+    "arp_macs": _run('grep -v IP /proc/net/arp | wc -l'),
+    "dmi": { "product": { "name": dmi_product, "uuid": _run("cat /sys/class/dmi/id/product_uuid") }, "bios": { "version": _run("cat /sys/devices/virtual/dmi/id/bios_version"), "vendor": _run("cat /sys/devices/virtual/dmi/id/bios_vendor")}, "board": { "product": board, "manufacturer": _run("cat /sys/devices/virtual/dmi/id/sys_vendor") }},
+    "virtual": _get_cpu_field("Hypervisor vendor", cpu_info) if _get_cpu_field("Hypervisor vendor", cpu_info) else 'physical',
+    "kernel": _run('uname'),
+    "kernelrelease": _run('uname -r'),
+    "networking": { "fqdn": _run("hostname -f")},
+    "os": { "type": "nethserver", "name": "NethServer", "release": { "full": "8", "major": "8", "minor": "0" }, "family": os_release.get("PRETTY_NAME", "n/a") },
+    "processors": { "count": _get_cpu_field("CPU(s)", cpu_info), "models": [  _get_cpu_field("Model name", cpu_info) ], "isa": _get_cpu_field("Architecture", cpu_info)},
+    "timezone": _run("timedatectl show -p Timezone --value"),
+    "system_uptime": { "seconds": _run("cat /proc/uptime | awk -F. '{print $1}'") },
+    "esmithdb": {
+        "networks": _get_networks(),
+        "configuration" : [
+            { "name": "sysconfig", "type": "configuration", "props": {"Version": "8"} },
+            { "name": "dns", "type": "configuration", "props": {"NameServers": _get_nameservers()} },
+            { "name" : "SystemName", "type" : _run("hostname -s") },
+            { "name" : "DomainName", "type" : _run("hostname -d") }
+        ],
+    },
+    "memory": {
+        "system": {
+            "available_bytes": podman_info["host"]["memFree"],
+            "used_bytes": podman_info["host"]["memTotal"] - podman_info["host"]["memFree"],
+            "total_bytes": podman_info["host"]["memTotal"],
+        },
+        "swap": {
+            "available_bytes": podman_info["host"]["swapFree"],
+            "used_bytes": podman_info["host"]["swapTotal"] - podman_info["host"]["swapFree"],
+            "total_bytes": podman_info["host"]["swapTotal"],
+        },
+    },
+    "mountpoints": _get_mountpoints(),
+    "rpms": {
+        "podman": podman_info["version"]["Version"],
+        "systemd": _run("systemd-analyze --version | awk 'NR == 1 { print $2 }'"),
+        "python": _run("python --version | awk '{ print $2 }'")
+    }
+}
+
+data.update(_get_cluster_views())
+
+json.dump(data, sort_keys=True, fp=sys.stdout)

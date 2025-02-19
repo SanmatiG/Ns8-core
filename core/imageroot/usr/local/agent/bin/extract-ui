@@ -1,0 +1,38 @@
+#!/bin/bash
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+image=${1:?missing image URL argument}
+
+set -e
+
+cid=$(podman create ${image})
+trap "podman rm ${cid}" EXIT
+
+uiroot=$(podman inspect ${cid} -f '{{index .Config.Labels "org.nethserver.uiroot"}}' | sed -r 's#(^/|/$)##')
+if [[ -z "${uiroot}" ]]; then
+    uiroot="ui" # Set the default path for the module frontend
+fi
+stripcount=$(awk -F/ '{ print NF }' <<<"${uiroot}")
+
+echo "Extracting container filesystem ${uiroot:-/} to ${PWD}"
+podman export ${cid} | tar -x -v -f - --exclude-caches-under --strip-components=${stripcount} "${uiroot}"
+chown -cR --reference=. .

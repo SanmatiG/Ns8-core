@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import sys
+import json
+import cluster.modules
+import agent
+
+rdb = agent.redis_connect(privileged=True)
+list_core_modules = cluster.modules.list_core_modules(rdb)
+available = cluster.modules.list_available(rdb, skip_core_modules = False)
+
+# Create a dictionary from available for quick lookup by name
+dict_available = {item['name']: item for item in available}
+
+# Update list_core_modules with data from dict_available
+for item in list_core_modules:
+    if item['name'] in dict_available:
+        matched_item = dict_available[item['name']]
+        # each installed modules must get its information
+        for instance in item['instances']:
+            instance.update({
+                "description": matched_item["description"],
+                "logo": matched_item["logo"],
+                "certification_level": matched_item["certification_level"] ,
+                "repository": matched_item["repository"],
+                "versions": matched_item["versions"],
+                "screenshots": matched_item["screenshots"],
+                "categories": matched_item["categories"],
+                "authors": matched_item["authors"],
+                "docs": matched_item["docs"],
+                "source": matched_item["source"]
+            })
+
+json.dump(list_core_modules, fp=sys.stdout)

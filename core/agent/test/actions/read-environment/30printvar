@@ -1,0 +1,3 @@
+#!/bin/bash
+
+echo -n "${VAR1}${AGENT_TASK_USER:?}"

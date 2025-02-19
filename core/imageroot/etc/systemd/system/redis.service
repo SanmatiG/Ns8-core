@@ -1,0 +1,35 @@
+[Unit]
+Description=Core Redis DB
+Documentation=https://github.com/NethServer/ns8-core
+Wants=wg-quick@wg0.service overlay-cleanup.service
+After=wg-quick@wg0.service overlay-cleanup.service
+
+[Service]
+Environment=PODMAN_SYSTEMD_UNIT=%n
+EnvironmentFile=/etc/nethserver/agent.env
+EnvironmentFile=-/etc/nethserver/core.env
+Restart=always
+TimeoutStopSec=70
+ExecStartPre=/bin/rm -f %t/redis.pid %t/redis.cid
+ExecStart=/usr/bin/podman run \
+    --conmon-pidfile=%t/redis.pid \
+    --cidfile=%t/redis.cid \
+    --cgroups=no-conmon \
+    --detach \
+    --log-opt=tag=%N \
+    --replace --name=%N \
+    --network=host \
+    --volume=redis-data:/data \
+    ${REDIS_IMAGE}
+
+ExecStartPost=-/usr/local/bin/redis-wait-ready --retries 30 --period 1
+ExecStartPost=-/usr/local/bin/acl-load
+ExecStartPost=-/usr/local/sbin/apply-vpn-routes
+ExecStop=/usr/bin/podman stop --ignore --cidfile %t/redis.cid -t 10
+ExecStopPost=/usr/bin/podman rm --ignore -f --cidfile %t/redis.cid
+PIDFile=%t/redis.pid
+Type=forking
+SyslogIdentifier=redis
+
+[Install]
+WantedBy=default.target

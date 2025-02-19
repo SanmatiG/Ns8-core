@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import sys
+import json
+import agent
+import agent.tasks
+import cluster.grants
+import cluster.modules
+import subprocess
+import os
+import re
+import uuid
+
+request = json.load(sys.stdin)
+node_id = int(request['node'])
+agent.assert_exp(node_id > 0)
+check_idle_time = request.get('check_idle_time')
+
+rdb = agent.redis_connect(privileged=True)
+
+# Skip nodes flagged as nomodules, like NS7 machines
+if rdb.sismember(f'node/{node_id}/flags', 'nomodules'):
+    print(f"Can't execute add-module on node {node_id}", file=sys.stderr)
+    sys.exit(1)
+
+image_url = request['image']
+# if the image name contains a slash, let's assume it's a valid image URL,
+# like ghr.io/nethserver/<image>:<tag>
+if "/" in request['image']:
+    image_url = request['image']
+else:
+    override = rdb.hget('cluster/override/modules', request['image'])
+    # use override from redis
+    if override:
+        image_url = override
+    else:
+    # search for the latest package inside the repository metadata
+        image_url = cluster.modules.get_latest_module(request['image'], rdb)
+
+image_id = agent.get_image_name_from_url(image_url)
+agent.assert_exp(image_url)
+
+# Pull the image from the remote server, if not already available locally
+agent.run_helper('podman-pull-missing', image_url, progress_callback=agent.get_progress_callback(0,33)).check_returncode()
+
+# Parse the image labels
+with subprocess.Popen(['podman', 'image', 'inspect', image_url], stdout=subprocess.PIPE, stderr=sys.stderr) as proc:
+    inspect = json.load(proc.stdout)
+    inspect_labels = inspect[0]['Labels']
+    inspect_image_id = inspect[0]['Id']
+    inspect_image_digest = inspect[0]['Digest']
+    inspect_image_repodigest = inspect[0]['RepoDigests'][0]
+
+if 'org.nethserver.rootfull' in inspect_labels:
+    is_rootfull = inspect_labels['org.nethserver.rootfull'] == "1"
+else:
+    is_rootfull = False
+
+if 'org.nethserver.tcp-ports-demand' in inspect_labels:
+    tcp_ports_demand = int(inspect_labels['org.nethserver.tcp-ports-demand'])
+else:
+    tcp_ports_demand = 0
+
+if 'org.nethserver.udp-ports-demand' in inspect_labels:
+    udp_ports_demand = int(inspect_labels['org.nethserver.udp-ports-demand'])
+else:
+    udp_ports_demand = 0
+
+if 'org.nethserver.authorizations' in inspect_labels:
+    authorizations = inspect_labels['org.nethserver.authorizations'].split()
+    if not cluster.grants.check_authorizations_sanity(authorizations):
+        print(agent.SD_ERR + f'Invalid org.nethserver.authorizations label value image_url={image_url}:', authorizations, file=sys.stderr)
+        sys.exit(2)
+else:
+    authorizations = []
+
+if 'org.nethserver.images' in inspect_labels:
+    extra_images = inspect_labels['org.nethserver.images'].split()
+else:
+    extra_images = []
+
+if 'org.nethserver.flags' in inspect_labels:
+    flags = inspect_labels['org.nethserver.flags'].split()
+else:
+    flags = []
+
+# Increment the module sequence for image_id (e.g. traefik => traefik1)
+module_id = image_id + str(rdb.incr(f'cluster/module_sequence/{image_id}'))
+
+# Initial module environment
+module_environment = {
+    'IMAGE_ID': inspect_image_id,
+    'IMAGE_URL': image_url,
+    'IMAGE_DIGEST': inspect_image_digest,
+    'IMAGE_REOPODIGEST': inspect_image_repodigest,
+    'MODULE_ID': module_id,
+    'NODE_ID': str(node_id),
+    'MODULE_UUID': str(uuid.uuid4())
+}
+
+# Set the "default_instance" keys for cluster and node, if module_id is the first instance of image
+for kdefault_instance in [f'cluster/default_instance/{image_id}', f'node/{node_id}/default_instance/{image_id}']:
+    default_instance = rdb.get(kdefault_instance)
+    if default_instance is None:
+        rdb.set(kdefault_instance, module_id)
+
+# Extract the UI code to a new module home
+os.mkdir(f'/var/lib/nethserver/cluster/ui/apps/{module_id}')
+os.chdir(f'/var/lib/nethserver/cluster/ui/apps/{module_id}')
+agent.run_helper('extract-ui', image_url).check_returncode()
+
+# Write on redis image ports demands
+if tcp_ports_demand > 0:
+    rdb.hset('cluster/tcp_ports_demand', mapping={module_id: tcp_ports_demand})
+    
+if udp_ports_demand > 0:
+    rdb.hset('cluster/udp_ports_demand', mapping={module_id: udp_ports_demand})
+
+# Wait for the module host to set up the module environment: it
+# has to return us the module password hash
+add_module_result = agent.tasks.run(
+    agent_id=f'node/{node_id}',
+    action='add-module',
+    data={
+        "module_id": module_id,
+        "is_rootfull": is_rootfull,
+        "environment": module_environment,
+        "tcp_ports_demand": tcp_ports_demand,
+        "udp_ports_demand": udp_ports_demand,
+    },
+    endpoint="redis://cluster-leader",
+    progress_callback=agent.get_progress_callback(34,66),
+    **({} if check_idle_time is None else {'check_idle_time': check_idle_time})
+)
+agent.assert_exp(add_module_result['exit_code'] == 0)
+
+outobj=add_module_result['output']
+
+# Create a new Redis user for module_id and set the password and permissions
+agent.assert_exp(rdb.execute_command('ACL', 'SETUSER',
+                    f'module/{module_id}', 'ON',
+                    '#' + outobj['redis_sha256'],
+                    'resetkeys', f'~module/{module_id}/*', f'~task/module/{module_id}/*',
+                    'resetchannels', f'&progress/module/{module_id}/*', f'&module/{module_id}/event/*',
+                    '+@read', '+@write', '+@transaction', '+@connection', '+publish', '-@admin') == 'OK')
+
+# Save ACLs on the disk and propagate to worker nodes
+cluster.grants.save_acls(rdb)
+
+# Every module is authorized for self-administration. The core implicitly
+# permits to run configure-module with the selfadm role, but the role can
+# be extended to permit more actions.
+if not 'self:selfadm' in authorizations:
+    authorizations.append('self:selfadm')
+
+# Save the node_id and persist authorizations, to enforce labels on future modules
+rdb.hset(f'cluster/module_node', module_id, node_id)
+if authorizations:
+    rdb.sadd(f'cluster/authorizations/module/{module_id}', *authorizations)
+    # Grant permissions to the new module, so it can run APIs in create-module too:
+    cluster.grants.add_module_permissions(rdb, module_id, authorizations, node_id)
+# Now that permissions are granted, we can run the create-module action of
+# the new module.
+
+# Push the creation task for the new module.
+create_module_result = agent.tasks.run(
+    agent_id=f'module/{module_id}',
+    action="create-module",
+    data={
+        'images': extra_images,
+    },
+    endpoint="redis://cluster-leader",
+    check_idle_time=0, # disable idle check and wait until the agent is up
+    progress_callback=agent.get_progress_callback(67,95),
+)
+agent.assert_exp(create_module_result['exit_code'] == 0) # Ensure create-module is successful
+
+# Configure our builtin roles: "owner" and "reader". Owner can run any action, Reader can run
+# action names with special prefixes.
+cluster.grants.grant(rdb, action_clause="*",      to_clause="owner",  on_clause=f'module/{module_id}')
+cluster.grants.grant(rdb, action_clause="list-*", to_clause="reader", on_clause=f'module/{module_id}')
+cluster.grants.grant(rdb, action_clause="get-*",  to_clause="reader", on_clause=f'module/{module_id}')
+cluster.grants.grant(rdb, action_clause="show-*", to_clause="reader", on_clause=f'module/{module_id}')
+cluster.grants.grant(rdb, action_clause="read-*", to_clause="reader", on_clause=f'module/{module_id}')
+
+# Grant the owner role to cluster owners on the new module
+for userk in rdb.scan_iter('roles/*'):
+    user_auths = rdb.hgetall(userk)
+    if 'cluster' in user_auths and user_auths['cluster'] == 'owner':
+        cluster.grants.alter_user(rdb, user=userk[len('roles/'):], revoke=False, role='owner', on_clause=f'module/{module_id}')
+
+# Scan existing modules to check if their permissions needs an update. The
+# new module is now among them:
+cluster.grants.refresh_permissions(rdb)
+
+# Save flags inside redis
+for flag in flags:
+    rdb.sadd(f'module/{module_id}/flags', flag)
+# Map rootfull label to a flag
+if is_rootfull:
+    rdb.sadd(f'module/{module_id}/flags', 'rootfull')
+else:
+    rdb.sadd(f'module/{module_id}/flags', 'rootless')
+
+# trigger an event to advertize other modules that a new module has been addded
+agent_id = os.environ['AGENT_ID']
+trx = rdb.pipeline()
+trx.publish(agent_id + '/event/module-added', json.dumps({
+    'module': module_id,
+    'node': node_id,
+}))
+trx.execute()
+
+json.dump({
+    "module_id": module_id,
+    "image_name": image_id,
+    "image_url": image_url,
+}, fp=sys.stdout)

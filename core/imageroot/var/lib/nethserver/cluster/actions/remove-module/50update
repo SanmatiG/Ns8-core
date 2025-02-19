@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import sys
+import json
+import agent
+import agent.tasks
+import os
+import cluster.grants
+
+request = json.load(sys.stdin)
+module_id = request['module_id']
+agent.assert_exp(module_id)
+preserve_data = request['preserve_data']
+forced_removal = request.get('force', False)
+agent.assert_exp(preserve_data is not None)
+
+#
+# 1. invoke the "destroy-module" action on the target module, if available
+# 2. invoke "remove-module" on every node
+# 3. wipe the module key space
+# 4. delete the Redis user
+#
+
+rdb = agent.redis_connect(privileged=True)
+
+try:
+    node_id = int(rdb.hget(f'module/{module_id}/environment', 'NODE_ID'))
+except Exception as ex:
+    print(agent.SD_ERR + f"Cannot retrieve the NODE_ID of {module_id}", file=sys.stderr)
+    sys.exit(1)
+
+podman_image_id = rdb.hget(f'module/{module_id}/environment', 'IMAGE_ID') or ""
+
+try:
+    # Invoke the module destructor, if defined. Rootfull modules must
+    # implement one, to stop running services.
+    destroy_module_result = agent.tasks.run(
+        agent_id=f'module/{module_id}',
+        action='destroy-module',
+        data={
+            "module_id": module_id,
+            "preserve_data": preserve_data,
+        },
+        endpoint="redis://cluster-leader",
+    )
+    if destroy_module_result['exit_code'] != 0:
+        raise Exception(f"non-zero exit-code from subtask")
+except Exception as ex:
+    if forced_removal:
+        print(agent.SD_WARNING + f"module/{module_id}/destroy-module failed:", ex, file=sys.stderr)
+    else:
+        raise ex
+
+try:
+    remove_module_result = agent.tasks.run(
+        agent_id=f'node/{node_id}',
+        action='remove-module',
+        data={
+            "module_id": module_id,
+            "preserve_data": preserve_data,
+        },
+        endpoint="redis://cluster-leader",
+    )
+    if remove_module_result['exit_code'] != 0: # The node remove-module action must succeed
+        raise Exception(f"non-zero exit-code from subtask")
+except Exception as ex:
+    if forced_removal:
+        print(agent.SD_WARNING + f"node/{node_id}/remove-module failed:", ex, file=sys.stderr)
+    else:
+        raise ex
+
+# If module_id is registered as default_instance, forget it:
+for kdef in rdb.scan_iter('*/default_instance/*'):
+    if rdb.get(kdef) == module_id:
+        rdb.delete(kdef)
+
+# Erase the module keyspace
+module_keys = []
+for kmodule in rdb.scan_iter(f'module/{module_id}/*'):
+    module_keys.append(kmodule)
+
+if module_keys:
+    rdb.delete(*module_keys)
+
+# Delete module from favorites
+rdb.srem('cluster/favorites', module_id)
+
+# Delete TCP and UDP port demands
+rdb.hdel('cluster/tcp_ports_demand', module_id)
+rdb.hdel('cluster/udp_ports_demand', module_id)
+
+# Delete module authorizations and node relation
+rdb.delete(f'cluster/authorizations/module/{module_id}')
+rdb.hdel('cluster/module_node', module_id)
+
+# Revoke module permissions, clean up permissions of other modules
+rdb.delete(f'roles/module/{module_id}')
+permpipe = rdb.pipeline()
+for ksubject in rdb.scan_iter('roles/*'):
+    rdb.hdel(ksubject, f'module/{module_id}')
+permpipe.execute()
+
+# Delete the Redis account
+agent.assert_exp(rdb.execute_command('ACL', 'DELUSER', f'module/{module_id}') == 1)
+
+# Save ACLs on the disk and propagate to worker nodes
+cluster.grants.save_acls(rdb)
+
+# Clean up the local Podman image copy, if still present
+if podman_image_id:
+    agent.run_helper("podman", "rmi", "--ignore", podman_image_id)
+
+# trigger an event to advertize other modules that a module has been removed
+agent_id = os.environ['AGENT_ID']
+trx = rdb.pipeline()
+trx.publish(agent_id + '/event/module-removed', json.dumps({
+    'module': module_id,
+    'node': node_id,
+}))
+
+# we get the list of domains from the cluster/module_domains hash
+values = rdb.hget("cluster/module_domains", module_id) or ""
+# Delete module_id key in module_domains hash
+trx.hdel("cluster/module_domains", module_id)
+# we trigger the event module-domain-changed with the list of domains
+trx.publish(agent_id + '/event/module-domain-changed', json.dumps({
+    "modules": [module_id],
+    "domains": values.split()
+}))
+
+trx.execute()
+
+json.dump({}, fp=sys.stdout)

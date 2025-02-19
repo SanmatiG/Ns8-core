@@ -1,0 +1,7 @@
+[Unit]
+Description=Cleanup the overlay-merged volume
+
+[Service]
+RemainAfterExit=true
+ExecStart=/usr/local/sbin/overlay-cleanup
+Type=oneshot

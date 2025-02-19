@@ -1,0 +1,252 @@
+#!/usr/local/bin/runagent python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import agent.tasks
+import json
+import argparse
+import os
+import requests
+import sys
+import getpass
+import agent
+import signal
+import fnmatch
+
+# Handled exceptions:
+from aiohttp import ClientError
+# we want to be compatible python 3.9 and 3.11
+try:
+    from aioredis import RedisError # fails with Python 3.11
+except:
+    from redis import RedisError
+from agent.tasks.exceptions import TaskError
+from requests import RequestException
+
+def _get_cachefile_path():
+    # Ensure there is a sane environment setup: fail if XDG_RUNTIME_DIR is
+    # not set.
+    return os.environ['XDG_RUNTIME_DIR'] + '/.api-cli.cache'
+
+def _cachefile_exists():
+    try:
+        return os.path.exists(_get_cachefile_path())
+    except KeyError:
+        return False
+
+def login_command(args):
+    if args.username:
+        username = args.username
+    else:
+        username = input('username: ')
+
+    if args.password:
+        password = args.password
+    else:
+        password = getpass.getpass('password: ')
+
+    if args.endpoint:
+        endpoint = args.endpoint
+    else:
+        endpoint = 'http://cluster-leader:9311'
+
+    response = requests.post(
+        endpoint + '/api/login',
+        data={'username': username, 'password': password},
+        verify=args.tlsverify,
+    )
+    response.raise_for_status()
+    token = response.json()['token']
+
+    if args.output:
+        print(token)
+    else:
+        oldmask = os.umask(0o77)
+        with open(_get_cachefile_path(), 'w') as fo:
+            fo.write(token)
+        os.umask(oldmask)
+        print(f"User {username}, login successful.")
+    return 0
+
+def logout_command(args):
+    try:
+        os.unlink(_get_cachefile_path())
+    except FileNotFoundError:
+        pass
+    return 0
+
+def run_command(args):
+    kwargs = {'tls_verify': args.tlsverify}
+    if args.token:
+        kwargs['auth_token'] = args.token
+    elif args.username:
+        # Override environment variables with command args value:
+        os.environ['REDIS_USER'] = args.username
+        os.environ['AGENT_ID'] = args.username
+        if args.password:
+            os.environ['REDIS_PASSWORD'] = args.password
+    elif _cachefile_exists():
+        # Use the cache file token
+        with open(_get_cachefile_path(), 'r') as fo:
+            token = fo.read()
+        token.rstrip("\n")
+        kwargs['auth_token'] = token
+
+    if args.endpoint:
+        kwargs['endpoint'] = args.endpoint
+    elif not 'auth_token' in kwargs and (os.getenv('AGENT_ID') == 'cluster' or os.getenv('REDIS_USER') == 'cluster'):
+        print('Warning: using user "cluster" credentials from the environment', file=sys.stderr)
+        # The "cluster" user has no roles. It can
+        # run actions with redis:// endpoint though.
+        kwargs['endpoint'] = 'redis://cluster-leader'
+
+    if args.data and args.data != '-':
+        data = json.loads(args.data)
+    else:
+        data = json.load(fp=sys.stdin)
+
+    if args.check_idle_time:
+        kwargs['check_idle_time'] = args.check_idle_time
+
+    if '/' in args.action:
+        if args.agent != 'cluster':
+            print(f'Warning: ignoring the command-line flag "--agent {args.agent}"', file=sys.stderr)
+        pagent, paction = args.action.rsplit('/', 1)
+    else:
+        pagent = args.agent
+        paction = args.action
+
+    kwargs.setdefault('extra', {
+        'title': f"{pagent}/{paction}",
+        'description': f"api-cli endpoint {kwargs.get('endpoint', 'default')}",
+        'isNotificationHidden': False,
+    })
+
+    if args.nowait:
+        response = agent.tasks.run_nowait(pagent, paction, data, **kwargs)
+        print(response)
+        return 0
+    else:
+        response = agent.tasks.run(pagent, paction, data, **kwargs)
+        print(response['error'], file=sys.stderr, end='')
+
+        if args.raw:
+            print(response['output'])
+        else:
+            json.dump(response['output'], fp=sys.stdout)
+            print()
+
+        return response['exit_code']
+
+def list_actions_command(args):
+    rdb = agent.redis_connect()
+
+    action_list = None
+
+    def run_list_actions(agent_id):
+        return agent.tasks.run(agent_id, 'list-actions', {}, endpoint='redis://cluster-leader')['output']
+
+    def print_matches(action_list, agent_id, paction, action_name):
+        if not action_name:
+            action_name = '*'
+        for naction in action_list:
+            if fnmatch.fnmatch(naction, paction) and fnmatch.fnmatch(naction, action_name):
+                print(agent_id + '/' + naction)
+
+    prefix = args.prefix
+    if not '*' in prefix:
+        prefix += '*' # append trailing slash
+
+    agent_type, agent_name, action_name = (prefix.split('/', 2) + [None, None, None])[0:3]
+
+    if agent_type == 'cluster': # shift positions
+        action_name = agent_name
+        agent_name = None
+        scanpat = 'cluster/roles/owner'
+    else:
+        scanpat = agent_type
+        if agent_name:
+            scanpat += '/' + agent_name
+        scanpat += '/roles/owner'
+
+    rolekeys = list(rdb.scan_iter(scanpat))
+
+    if len(rolekeys) == 1: # exact role match: dig it more
+        krole = rolekeys.pop()
+        agent_id = krole.removesuffix('/roles/owner')
+        action_list = run_list_actions(agent_id)
+        for pataction in rdb.smembers(krole):
+            print_matches(action_list, agent_id, pataction, action_name)
+    else: # just print out entries for agent_id completion
+        for krole in rolekeys:
+            agent_id = krole.removesuffix('roles/owner')
+            print(agent_id)
+
+    return 0
+
+root_parser = argparse.ArgumentParser(description='Invoke cluster APIs from the command line')
+root_parser.add_argument('--endpoint', help='override the library default endpoint URL')
+root_parser.add_argument('--no-tlsverify', dest='tlsverify', action='store_false', default=True, help="do not verify the TLS certificate")
+
+subparsers = root_parser.add_subparsers(title="commands", required=True, dest='command')
+
+login_parser = subparsers.add_parser('login', help="authenticate with the remote server")
+login_parser.add_argument('-u', '--username')
+login_parser.add_argument('-p', '--password')
+login_parser.add_argument('-o', '--output', help="print the authorization token instead of writing it to the disk", action='store_true')
+
+login_parser = subparsers.add_parser('logout', help="clean up the authorization token disk cache")
+
+submit_parser = subparsers.add_parser('run', aliases=['submit'], help="submit a task to the remote server and print the results")
+submit_parser.add_argument('action', metavar='agent/action', help='action name, e.g. "list-actions" or agent/action qualifier, e.g. "node/1/list-actions"')
+
+auth_group = submit_parser.add_mutually_exclusive_group()
+auth_group.add_argument('-t', '--token', help='authorization token returned by the "login -o" command')
+auth_group.add_argument('-u', '--username')
+
+submit_parser.add_argument('-p', '--password', help="requires --username")
+submit_parser.add_argument('-a', '--agent', help='agent ID (e.g. "module/traefik1"). Defaults to "cluster"', default='cluster')
+submit_parser.add_argument('-d', '--data', help='string in JSON format, set as task input data. Special value "-" reads data from stdin', default="null")
+submit_parser.add_argument('--check-idle-time', help='check the agent client idle time does not exceed the given number of seconds (0=disabled)', type=int)
+submit_parser.add_argument('--nowait', help='do not wait for task completion. Return immediately the task ID', action='store_true')
+submit_parser.add_argument('--raw', help='convert output with print() instead dumping it in JSON format', action='store_true')
+
+list_actions_parser = subparsers.add_parser('list-actions', help='list actions granted to role "owner"')
+list_actions_parser.add_argument('prefix', default='', nargs='?', help='expand and filter with the given prefix')
+
+args = root_parser.parse_args()
+
+command = globals().get(args.command.replace('-', '_') + '_command')
+
+def sigint_handler(*args):
+    print('SIGINT caught! Sending cancel-task requests...', file=sys.stderr)
+    signal.raise_signal(signal.SIGTERM)
+
+signal.signal(signal.SIGINT, sigint_handler)
+
+try:
+    exit_code = command(args)
+
+except (ClientError, RedisError, TaskError, RequestException) as ex:
+    print(f'{ex.__class__.__name__}: {ex}', file=sys.stderr)
+    exit_code = 1
+
+sys.exit(exit_code)

@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2023 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+import agent
+import sys
+import os
+import agent.tasks
+import cluster.modules
+import json
+
+if not os.getenv("AGENT_TASK_USER"):
+    # If invoked from apply-updates command, switch to managed repo view:
+    cluster.modules.select_repo_view('managed')
+
+request = json.load(sys.stdin)
+rdb = agent.redis_connect(privileged=True)
+updates = cluster.modules.list_updates(rdb, skip_core_modules = True)
+
+if 'modules' in request:
+    # Filter out non-matching modules:
+    updates = list(filter(lambda uo: uo['module'] in request['modules'], updates))
+
+if 'instances' in request:
+    # Filter out non-matching instances:
+    updates = list(filter(lambda uo: uo['id'] in request['instances'], updates))
+
+if len(updates) == 0:
+    print(agent.SD_INFO, "update-modules: no update found. Filters:", request, file=sys.stderr)
+    sys.exit(0)
+
+errors = 0
+# The increment of each update to calculate the task progress could be a
+# decimal number: when calculating the progress range, round values to
+# integer numbers!
+ustep = 100 / len(updates)
+uidx = 0
+for oupdate in updates:
+    module = oupdate['id']
+    module_url = f"{oupdate['source']}:{oupdate['update']}"
+
+    start = int(uidx * ustep)
+    # ustep can be less than 1, with more than 100 updates: ensure "end"
+    # is always greater than "start" and is an integer value
+    end = start + max(int(ustep), 1)
+    upd_module_result = agent.tasks.run("cluster", "update-module",
+        data={"instances": [module], "module_url": module_url},
+        endpoint="redis://cluster-leader",
+        progress_callback=agent.get_progress_callback(start, end)
+    )
+    uidx += 1
+    if upd_module_result['exit_code'] != 0:
+        print(agent.SD_ERR + f"Failed update-module for instance {module} with {module_url}", file=sys.stderr)
+        errors += 1
+
+if errors > 0:
+    sys.exit(2)

@@ -1,0 +1,40 @@
+#!/bin/bash
+
+#
+# Copyright (C) 2021 Nethesis S.rdb.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServerdb.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServerdb.  If not, see COPYING.
+#
+
+#
+# 1. Enable wg0 at system boot
+# 2. Configure firewalld to trust the VPN network
+#
+
+set -e
+exec 1>&2
+systemctl enable wg-quick@wg0.service
+
+read -r network < <(jq -r '.network')
+# 0. Allow connections to the wireguard UDP port from
+#    the default firewall zone.
+# 1. Trust connections from the wireguard VPN
+firewall-cmd --permanent --new-service=ns-wireguard || :
+firewall-cmd --permanent --add-service=ns-wireguard
+firewall-cmd --permanent --service=ns-wireguard --add-port=55820/udp
+firewall-cmd --permanent --zone=trusted --add-source="${network}"
+firewall-cmd --reload

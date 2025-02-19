@@ -1,0 +1,54 @@
+#!/bin/bash
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+set -e
+exec 1>&2
+
+# B1-UPGRADE: clean up legacy log_tag.conf before restarting the module
+# containers. A system reboot is recommended, anyway.
+if [[ $EUID != 0 ]]; then
+    rm -vf ~/.config/containers/containers.conf.d/log_tag.conf
+fi
+
+if [[ ! -d "${AGENT_INSTALL_DIR}"/update-module.d/ ]]; then
+    exit 0
+fi
+
+# systemd-journal log severity codes:
+SD_DEBUG='<7>'
+SD_WARNING='<4>'
+
+shopt -s nullglob
+for script in "${AGENT_INSTALL_DIR}"/update-module.d/* ; do
+
+    if [[ ! -x "${script}" ]]; then
+        echo "${SD_DEBUG}Skipping non-executable file ${script}..."
+        continue
+    fi
+
+    echo "Running ${script}..."
+
+    if ! command ${script} ; then
+        echo "${SD_WARNING}${script} has failed"
+    fi
+
+done

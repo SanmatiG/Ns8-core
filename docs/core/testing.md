@@ -1,0 +1,131 @@
+---
+layout: default
+title: Testing suite
+nav_order: 11
+parent: Core
+---
+
+# Testing suite
+
+* TOC
+{:toc}
+
+## Requisites
+
+The tests have been created using [Robot Framework](https://robotframework.org/) and the execution happens inside a Podman container. The only dependency required
+in the host system is [Podman](https://podman.io/getting-started/installation).
+
+## Tests structure
+
+All tests are in the `tests` directory of each NS8 module, in the root of the `tests` directory the file `pythonreq.txt`
+specifies the dependencies required and each sub-directory contains a test suite with the related tests.
+
+The test suite and the related tests are executed in alphabetical order, the `__init__.robot` can be used for the suite
+initialization. More details in the [Robot Framework documentation](https://robotframework.org/robotframework/latest/RobotFrameworkUserGuide.html#files-and-directories).
+
+```
+<module>/tests/
+├── 00_<test_suite>
+│   ├── 00_<test>.robot
+│   ├── 10_<test>.robot
+│   ├── 20_<test>.robot
+│   ├── ...
+│   ├── ...
+│   └── __init__.robot
+├── 01_<test_suite>
+│   ├── 00_<test>.robot
+│   ├── 10_<test>.robot
+│   ├── 20_<test>.robot
+│   ├── ...
+│   ├── ...
+│   └── __init__.robot
+├── ...
+│   ├── ...
+│   ├── ...
+│   └── __init__.robot
+├── pythonreq.txt
+└── __init__.robot
+```
+
+## Tests execution
+
+Every module has a script named `test-module.sh` that can be used to setup and launch the tests related to the module. All the tests logs can be found in the directory `tests/outputs`.
+
+### Usage
+
+All the scripts have a common way to customize the execution.
+
+    ./test-module.sh <leader_node> <worker_node1,worker_node2,...>
+
+When lunching the script, make sure the specified `SSH_KEYFILE` is accessible without password, otherwise the connection
+to remote host will fail.
+
+#### Parameters
+
+* `<leader_node>`: The host of the leader node.
+* `<worker_node1,worker_node2,...>`: A list of comma separated worker hosts.
+
+#### Environment variables
+
+* `SSH_KEYFILE`: SSH private key to use for connection to the NS8 cluster, default `~/.ssh/id_rsa`.
+* `COREMODULES`: list of space-separated module URL to pull and use during the NS8 installation process.
+
+The `COREMODULES` have the same meaning as the [`install.sh`](docs/quickstart.md#install-a-development-branch) parameters.
+
+#### Include/exclude test cases
+
+Test cases can be marked with [Robot Framework tags](https://robotframework.org/robotframework/latest/RobotFrameworkUserGuide.html#tagging-test-cases) to allow the inclusion and/or exclusion of test cases during tests execution.
+
+Core test suites `10_cluster_sanity` and `20_cluster_ui` are marked respectively with `backend` and `frontend` tags. To execute only backend tests (those included in `10_cluster_sanity`) you can edit `robot` command provided in `test-module.sh`, adding `include` parameter:
+
+    podman run ... robot ... --include backend ...
+
+The same goes for executing only frontend tests:
+
+    podman run ... robot ... --include frontend ...
+
+Some test cases of core module are marked with `install` or `uninstall` tag. More precisely:
+
+- test cases related to NS8 installation and cluster creation are marked with `install` tag
+- test cases related to NS8 removal are marked with `uninstall` tag
+
+This pair of tags make it easy to quickly execute tests on a machine with NS8 already installed and configured. Skipping installation, cluster creation and uninstallation drastically reduces tests execution time. To skip NS8 installation, configuration and uninstallation you can edit `robot` command provided in `test-module.sh`:
+
+    podman run ... robot ... --exclude install --exclude uninstall ...
+
+#### Headful mode
+
+The execution of UI tests normally happens in headless mode, i.e. without showing the browser window. Anyway, for tests development and debug purposes, seeing test execution in the browser can be very helpful.
+
+At the moment, the only way to do this is to run the tests on your host machine, outside a podman container. Robot Framework installation on your machine is required:
+the quickest way to install it is using pip `pip install -r core/tests/pythonreq.txt`, other installations methods are available inside [the manual](https://robotframework.org/robotframework/latest/RobotFrameworkUserGuide.html#toc-entry-209).
+Then you can run `robot` command with `HEADLESS` variable set to `false`, e.g.:
+
+    cd ns8-core
+    robot -v NODE_ADDR:<LEADER_IP_ADDR> -v HEADLESS:false -v SSH_KEYFILE:$HOME/.ssh/id_rsa -d $HOME/ns8-test-outputs tests/
+
+In the command above we are assuming that:
+
+- `$HOME/.ssh/id_rsa` is the SSH identity file to access you NS8 leader machine
+- `$HOME/ns8-test-outputs` is the location where test report and logs will be written
+
+## Testing environment
+
+A `terraform` configuration for create a clean infrastucture for the tests execution can be found in the [`ns8-terraform-infra`](https://github.com/NethServer/ns8-terraform-infra) repository.
+
+If you want to use the key generated by Terraform scripts, remember to [export it](https://github.com/NethServer/ns8-terraform-infra#default-ssh-keys-pair) and set `SSH_KEYFILE`
+accordingly:
+
+    SSH_KEYFILE=../../ns8-terraform-infra/key ./test-module.sh <leader_node> <worker_node1,worker_node2,...>
+
+To access the leader and the nodes with the generated key, use:
+
+    ssh -i ../../ns8-terraform-infra/key <leader_node>
+
+**Example**
+
+Given a domain named `test.nethserver.org`, running on CentOS Stream 9 on `cluster0` workspace, the command to launch the test suites
+should be:
+
+    SSH_KEYFILE=../../ns8-terraform-infra/key ./test-module.sh cs1.leader.cluster0.test.nethserver.org
+

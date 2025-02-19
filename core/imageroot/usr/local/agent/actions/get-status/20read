@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+#
+# Read module status
+#
+
+import os
+import sys
+import glob
+import json
+import agent
+import os.path
+import subprocess
+
+# Prepare return variable
+status = {}
+
+rdb = agent.redis_connect()
+status["instance"] = os.environ["MODULE_ID"]
+status["ui_name"] = rdb.get(f'module/{os.environ["MODULE_ID"]}/ui_name') or ""
+status["node"] = os.environ["NODE_ID"]
+status["node_ui_name"] = rdb.get(f'node/{status["node"]}/ui_name') or ""
+
+rootfull = os.getuid() == 0
+image_filter = []
+
+if rootfull:
+    systemd_path = f'{status["instance"]}*.service'
+    base_dir= '/etc/systemd/system/'
+    # prepare image filter
+    env = agent.read_envfile(os.environ["AGENT_STATE_DIR"] + "/environment")
+    for key in env.keys():
+        if key.endswith("_IMAGE"):
+            image_filter.append(env[key])
+else:
+    systemd_path = '*.service'
+    base_dir = f'{os.environ["AGENT_INSTALL_DIR"]}/systemd/user/'
+
+status["services"] = []
+units = []
+
+# find all services paths and retrieve unit names
+for file in glob.glob(base_dir+systemd_path):
+    # look for templates
+    if file.endswith('@.service'):
+        # replace the name of the unit foo@.service to foo@*.service
+        unit = os.path.basename(file.replace('@.service', '@*.service'))
+        for template in glob.glob(base_dir + 'default.target.wants/' + unit, recursive=False):
+            # add only the unit name
+            units.append(os.path.basename(template))
+    else:
+        units.append(os.path.basename(file))
+
+# iterate over units and retrieve status
+for unit in units:
+    service = {"name": unit.removesuffix(".service")}
+    for a in ["active", "enabled", "failed"]:
+        if rootfull:
+            service[a] = subprocess.run(["systemctl", "-q", f"is-{a}", unit]).returncode == 0
+        else:
+            service[a] = subprocess.run(["systemctl", "-q", "--user", f"is-{a}", unit]).returncode == 0
+    status["services"].append(service)
+
+status["images"] = []
+try:
+    images = subprocess.run(["podman", "image", "list", "--format", "{{index .Names 0}},{{.Size}},{{.CreatedAt}}"], capture_output=True, text=True, check=True)
+    for i in images.stdout.split("\n"):
+        # skip empty lines
+        if not i:
+            continue
+        info = i.split(",")
+        # add all non-rootfull images
+        # add only rootfull images matching the image filter
+        if (not rootfull) or (rootfull and info[0] in image_filter):
+            status["images"].append({"name": info[0], "size": info[1], "created": info[2]})
+except:
+    pass
+
+status["volumes"] = []
+try:
+    images = subprocess.run(["podman", "volume", "ls", "--format", "{{.Name}},{{.Mountpoint}},{{.CreatedAt}}"], capture_output=True, text=True, check=True)
+    for i in images.stdout.split("\n"):
+        # skip empty lines
+        if not i:
+            continue
+        info = i.split(",")
+        # add all non-rootfull volumes
+        # add only rootfull volumes starting with the module_id
+        if (not rootfull) or (rootfull and info[0].startswith(status["instance"])):
+            status["volumes"].append({"name": info[0], 'mount': info[1], "created": info[2]})
+except:
+    pass
+
+
+# Dump the result
+json.dump(status, fp=sys.stdout)

@@ -1,0 +1,53 @@
+#!/usr/local/bin/runagent python3
+
+#
+# Copyright (C) 2021 Nethesis S.r.l.
+# http://www.nethesis.it - nethserver@nethesis.it
+#
+# This script is part of NethServer.
+#
+# NethServer is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or any later version.
+#
+# NethServer is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with NethServer.  If not, see COPYING.
+#
+
+# XXX temporary implementation!!!
+
+import sys
+import agent.tasks
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('module')
+parser.add_argument('--no-preserve', dest='preserve_data', default=True, action='store_false', help="erase also the module home directory")
+parser.add_argument('--force', default=False, action='store_true', help="unconditionally erase the module from Redis (dangerous)")
+args = parser.parse_args()
+
+result = agent.tasks.run(
+    agent_id='cluster',
+    action='remove-module',
+    data={
+        'module_id': args.module,
+        'preserve_data': bool(args.preserve_data),
+        'force': args.force,
+    },
+    extra={
+        'title': "cluster/remove-module",
+        'description': "remove-module command",
+        'isNotificationHidden': False,
+    },
+    endpoint="redis://cluster-leader",
+)
+
+print(result['error'], file=sys.stderr, end='')
+print(result['output'])
+sys.exit(result['exit_code'])
